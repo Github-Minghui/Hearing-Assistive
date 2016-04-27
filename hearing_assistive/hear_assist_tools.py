@@ -23,7 +23,23 @@ import copy
 import math
 
 #################################################################################################
+#
+# TABLE OF CONTENTS:
+#
+# 1.  Global Functions
+# 2.  Wave Class
+# 3.  _SpectrumParent Class
+# 4.  Spectrum Class
+# 5.  Dct Class
+# 6.  Spectrogram Class
+# 
+#################################################################################################
 
+#################################################################################################
+#
+# 1.  GLOBAL FUNCTIONS
+#
+#################################################################################################
 
 def read_wave(filename='sound.wav'):
     # Reads a wave file
@@ -71,8 +87,62 @@ def find_index(x, xs):
 
 	return int(i)
 
-###########################################################################################
+def unbias(ys):
+	# shifts a wave array so it has mean 0
+	#
+	# ys: wave array
+	#
+	# return: wave array
 
+	return ys - ys.mean()
+
+def normalize(ys, amp=1.0):
+	# normalize a wave array so the maximum amplitude is +amp or -amp
+	#
+	# ys: wave array
+	# amp: max amplitude (pos or neg) in result
+	#
+	# return: wave array
+    
+    high = abs(max(ys))
+    low = abs(min(ys))
+
+    return amp * ys / max(high, low)
+
+def apodize(ys, framerate, denom=20, duration=0.1):
+	# tapers the amplitude at the beginning and end of the signal.
+	#
+	# tapers either the given duration of time or the given fraction of the total duration, whichever is less
+	#
+	# ys: wave array
+	# framerate: int frames per second
+	# denom: float fraction of the segment to taper
+	# duration: float duration of the taper in seconds
+	#
+	# return: wave array
+
+    # a fixed fraction of the segment
+    n = len(ys)
+    k1 = n // denom
+
+    # a fixed duration of time
+    k2 = int(duration * framerate)
+
+    k = min(k1, k2)
+
+    w1 = np.linspace(0, 1, k)
+    w2 = np.ones(n - 2*k)
+    w3 = np.linspace(1, 0, k)
+
+    window = np.concatenate((w1, w2, w3))
+    return ys * window
+
+
+###########################################################################################
+#
+# 2.  WAVE CLASS
+#
+###########################################################################################
 
 class Wave:
 	# represents a discrete-time waveform
@@ -117,8 +187,6 @@ class Wave:
 
 	    return len(self.ys) / float(self.framerate)
 
-	#####################################################################
-
 	def find_index(self, t):
 		# find the index corresponding to a given time
 	   	
@@ -157,6 +225,27 @@ class Wave:
 	    ts = self.ts[i:j].copy()
 	    return Wave(ys, ts, self.framerate)
 
+	def partition(self, seg_length=2.4):
+	    # partition the wave into segments
+	    #
+	    # seg_length: length of each segment in seconds
+	    #
+	    # return: list of Wave segments
+	    
+	    i = 0
+	    j = int(seg_length * self.framerate)  # frames per segment
+	    step = int((seg_length / 2) * self.framerate)   # 50% overlap
+
+	    seg_map = []
+	    while j < len(self.ys):
+	        segment = self.slice(i, j)
+	        seg_map.append(segment)
+
+	        i += step
+	        j += step
+	        
+	    return seg_map  # list of Wave segments
+
 	def make_spectrum(self, full=False):
 		# computes the spectrum using fast fourier transform (FFT)
 		#
@@ -176,6 +265,17 @@ class Wave:
 
 		return Spectrum(hs, fs, self.framerate, full)
 
+	def make_dct(self):
+		# compute the discrte cosine transform of this wave
+		#
+		# return: Dct
+
+		n = len(self.ys)
+		hs = scipy.fftpack.dct(self.ys, type=2)
+		fs = (0.5 + np.arange(n)) / 2
+
+		return Dct(hs, fs, self.framerate)
+
 	def make_spectrogram(self, seg_length, win_flag=True):
 		# computes the spectrogram of the wave
 		#
@@ -194,7 +294,7 @@ class Wave:
 		# map from time to spectrum   
 		spec_map = {}
 
-		while j < len(self.ys):
+		while j <= len(self.ys):
 			segment = self.slice(i, j)
 			
 			if win_flag:
@@ -208,8 +308,6 @@ class Wave:
 			j += step
 
 		return Spectrogram(spec_map, seg_length)
-
-	####################################################################
 
 	def normalize(self, amp=1.0):
 		# normalize the signal to the given amplitude
@@ -234,10 +332,10 @@ class Wave:
 		self.framerate = self.framerate * factor
 		self.ts = np.arange(len(self.ys)) / self.framerate
 
-	############################################################################
-
 	def plot(self, title=None):
 		# plots the wave
+		#
+		# title: title of the plot
 
 		time = np.linspace(self.start, self.duration, len(self.ys))	# get seconds
 
@@ -256,7 +354,10 @@ class Wave:
 		return audio
 
 ############################################################################
-
+#
+# 3.  _SPECTRUMPARENT CLASS
+#
+############################################################################
 
 class _SpectrumParent:
 	# contains code common to Spectrum
@@ -383,7 +484,10 @@ class _SpectrumParent:
 		return peaks
 
 ####################################################################################
-
+#
+# 4.  SPECTRUM CLASS
+#
+####################################################################################
 
 class Spectrum(_SpectrumParent):
 	# represents the spectrum of a signal
@@ -420,7 +524,83 @@ class Spectrum(_SpectrumParent):
 		indices = (low_cutoff < fs) & (fs < high_cutoff)
 		self.hs[indices] *= factor
 
-	################################################################################
+	def freqToMel(self, freq):
+	    # convert a frequency value to its Mel scale value
+
+	    return 1127 * math.log(1 + freq / 700.0)
+
+	def melToFreq(self, mel):
+	    # convert a Mel scale value to its frequency value 
+
+	    return 700 * (math.exp(mel / 1127.0 - 1))
+
+	def melFilterBank(self, minHz, maxHz, numFilters, blocksize):
+	    # compute the mel-spaced filterbank that will be applied to a power spectrum.
+	    #
+	    # minHz: lower frequency bound
+	    # maxHz: upper frequency bound
+	    # numFilters: the number of triangular filters (which is the number of coefficients)
+	    # blocksize: the size of each filter (equal to (seg_length / 2) + 1)
+	    #
+	    # return: a matrix of triangular filters, each of length blocksize
+
+	    minMel = self.freqToMel(minHz)
+	    maxMel = self.freqToMel(maxHz)
+
+	    filterMatrix = np.zeros((numFilters, blocksize))  # create matrix for triangular filters
+
+	    # our range needs (numFilters + 2) linearly spaced points, each filter requires three points
+	    melRange = np.array(xrange(numFilters + 2)) 
+
+	    # calculate linearly spaced mel values between minMel and maxMel 
+	    melCenterFilters = melRange * (maxMel - minMel) / (numFilters + 1) + minMel 
+
+	    aux = np.log(1 + 1000.0 / 700.0) / 1000.0
+	    aux = (np.exp(melCenterFilters * aux) - 1) / 22050
+	    aux = 0.5 + 700 * blocksize * aux
+	    aux = np.floor(aux)
+	    centerIndex = np.array(aux, int)   # each index represents the center of each triangular filter
+
+	    for i in xrange(numFilters):
+	        start, center, end = centerIndex[i:i + 3]
+	        k1 = np.float32(center - start)
+	        k2 = np.float32(end - center)
+	        up = (np.array(xrange(start, center)) - start) / k1
+	        down = (end - np.array(xrange(center, end))) / k2
+	        filterMatrix[i][start:center] = up
+	        filterMatrix[i][center:end] = down
+
+	    return filterMatrix.transpose()
+
+	def get_mfcc(self, minHz=20, maxHz=22050, numFilters=26, blocksize=883):
+		# compute the MFCCs of the given spectrum
+		#
+		# minHz: lower frequency bound
+	    # maxHz: upper frequency bound
+	    # numFilters: the number of triangular filters (which is the number of coefficients)
+	    # blocksize: the size of each filter (equal to (segment_length / 2) + 1)
+		# 
+		# by default, assume the given spectrum has a segment_length of 1764 (which is 40ms at 44100fps)
+		# 
+		# return: feature vector (1D array of length numFilters)
+
+		hs = self.hs    # length is equal to ((segment_length/2)+1) (result of FFT)
+		fs = self.fs
+		framerate = self.framerate
+		full = self.full
+
+		powers = self.power   # get spectrum power values
+
+		# create the mel-filterbank, shape of the filterbank is (blocksize, numFilters)
+		filterbank = self.melFilterBank(minHz, maxHz, numFilters, blocksize)  
+
+		filtered_spectrum = np.dot(powers, filterbank)   # shape of filtered_spectrum is a 1D array of length numFilters
+
+		log_spectrum = np.log(filtered_spectrum)   # take the logarithm of each of the filterbank energies 
+
+		mfcc =  scipy.fftpack.dct(log_spectrum, type=2)  # take the DCT of these log filterbank energies
+
+		return mfcc    
 
 	def make_wave(self):
 		# transforms to the time domain
@@ -434,10 +614,38 @@ class Spectrum(_SpectrumParent):
 
 		return Wave(ys, framerate=self.framerate)
 
+
+#################################################################################################
+#
+# 5.  DCT CLASS
+#
 #################################################################################################
 
+class Dct(_SpectrumParent):
+	# represents the spectrum of a signal using discrete cosine transform.
 
+	@property
+	def amps(self):
+		# returns a sequence of amplitudes (read-only property)
+		# NOTE: for DCT, amps are positive and negative real values
 
+	    return self.hs
+
+	def make_wave(self):
+		# transforms to the time domain
+		#
+		# return: Wave
+
+		n = len(self.hs)
+		ys = scipy.fftpack.idct(self.hs, type=2) / 2 / n
+
+		return Wave(ys, framerate=self.framerate)
+	
+
+#################################################################################################
+#
+# 6.  SPECTROGRAM CLASS
+#
 #################################################################################################
 
 class Spectrogram:
@@ -474,9 +682,34 @@ class Spectrogram:
 		fs = self.any_spectrum().fs
 		return fs
 
+	def mfcc(self, minHz=20, maxHz=22050, numFilters=26, numCoefficients=13, blocksize=883):
+		# compute the MFCCs of the given set of spectrums
+		#
+		# minHz: lower frequency bound
+	    # maxHz: upper frequency bound
+	    # numFilters: the number of triangular filters (which is the number of coefficients per spectrum)
+	    # numCoefficients: the number of coefficients taken from the filters
+	    # blocksize: the size of each filter (equal to (segment_length / 2) + 1)
+		# 
+		# by default, assume each spectrum has a segment_length of 1764 (which is 40ms at 44100fps)
+		# 
+		# return: feature matrix (2D array of numFilters by number of spectrums (aka length of spec_map))
+
+		mfcc_matrix = []
+		for t, spectrum in sorted(self.spec_map.iteritems()):
+			sub_mfcc = spectrum.get_mfcc(minHz, maxHz, numFilters, blocksize)   # get the mfcc of each spectrum in spec_map
+			# only include the coefficients between the range specified by numCoefficients, starting with the second coefficient
+			sub_mfcc = sub_mfcc[1:numCoefficients+1]   
+			mfcc_matrix.append(sub_mfcc)
+
+		mfcc_matrix = np.asarray(mfcc_matrix)    # typecast as numpy array
+
+		return mfcc_matrix    # (number of spectrums, numFilters) feature matrix 
+
 	def plot(self, title=None, high=None):
 		# make a psuedocolor plot
 		# 
+		# title: title of the plot
 		# high: highest frequency component to plot
 
 		wave = self.make_wave()	
@@ -525,47 +758,3 @@ class Spectrogram:
 			ys[start:end] = wave.ys
 
 		return Wave(ys, framerate=wave.framerate)
-
-#################################################################################################
-
-
-def normalize(ys, amp=1.0):
-	# normalize a wave array so the maximum amplitude is +amp or -amp
-	#
-	# ys: wave array
-	# amp: max amplitude (pos or neg) in result
-	#
-	# return: wave array
-    
-    high = abs(max(ys))
-    low = abs(min(ys))
-
-    return amp * ys / max(high, low)
-
-def apodize(ys, framerate, denom=20, duration=0.1):
-	# tapers the amplitude at the beginning and end of the signal.
-	#
-	# tapers either the given duration of time or the given fraction of the total duration, whichever is less
-	#
-	# ys: wave array
-	# framerate: int frames per second
-	# denom: float fraction of the segment to taper
-	# duration: float duration of the taper in seconds
-	#
-	# return: wave array
-
-    # a fixed fraction of the segment
-    n = len(ys)
-    k1 = n // denom
-
-    # a fixed duration of time
-    k2 = int(duration * framerate)
-
-    k = min(k1, k2)
-
-    w1 = np.linspace(0, 1, k)
-    w2 = np.ones(n - 2*k)
-    w3 = np.linspace(1, 0, k)
-
-    window = np.concatenate((w1, w2, w3))
-    return ys * window
